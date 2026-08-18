@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- Marketplace listing: screenshots, cleaned README, source repository link.
+
 ## 0.4.0
 
 First public release.

@@ -7,3 +7,5 @@ package-lock.json
 .gitignore
 test/**
 *.vsix
+.env
+.env.*

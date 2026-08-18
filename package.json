@@ -2,7 +2,7 @@
   "name": "vox-ai-guide",
   "displayName": "Vox AI Guide for VSCode",
   "description": "Explains where your Copilot and Claude configuration lives, what it costs in tokens, and which credentials it exposes. Local only, nothing is written without a preview.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "plog",
   "icon": "media/icon.png",
   "engines": {
