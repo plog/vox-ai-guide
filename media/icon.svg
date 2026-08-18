@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 66 66">
+  <!--
+    Derived from the Vox Teneo logo: the triangle alone. The word "VOX" from the full logo
+    becomes unreadable at 24px, and VSCode renders activity bar icons in monochrome
+    (recoloured by the theme, 60% opacity at rest). Hence `currentColor` and no brand
+    colour here — `viewsContainers` accepts neither a light/dark variant nor flat colour.
+    The colour logo stays in use where it renders as-is.
+  -->
+  <g transform="translate(0 7.8)" fill="currentColor" fill-rule="evenodd" clip-rule="evenodd">
+    <path d="M32.9082 50.4246L65.9025 0H0L32.9082 50.4246ZM33.0387 29.471L21.3557 11.4601H44.9194L33.0387 29.471Z"/>
+  </g>
+</svg>

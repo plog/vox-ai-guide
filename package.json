@@ -1,0 +1,134 @@
+{
+  "name": "vox-ai-guide",
+  "displayName": "Vox AI Guide for VSCode",
+  "description": "Explains where your Copilot and Claude configuration lives, what it costs in tokens, and which credentials it exposes. Local only, nothing is written without a preview.",
+  "version": "0.4.0",
+  "publisher": "plog",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "voxAiGuide.run",
+        "title": "Vox AI: Diagnose my AI configuration",
+        "category": "Vox AI",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "voxAiGuide.showUsage",
+        "title": "Vox AI: How is my Claude session doing?",
+        "category": "Vox AI"
+      },
+      {
+        "command": "voxAiGuide.sessions",
+        "title": "Vox AI: List my Claude conversations (and compact one)",
+        "category": "Vox AI"
+      },
+      {
+        "command": "voxAiGuide.checkTranscripts",
+        "title": "Vox AI: Scan my Claude transcripts for secrets",
+        "category": "Vox AI"
+      },
+      {
+        "command": "voxAiGuide.refresh",
+        "title": "Re-run the diagnostic",
+        "category": "Vox AI",
+        "icon": "$(refresh)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "voxAiGuide",
+          "title": "Vox AI Guide",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "voxAiGuide": [
+        {
+          "id": "voxAiGuide.home",
+          "name": "Diagnostic",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "voxAiGuide.refresh",
+          "when": "view == voxAiGuide.home",
+          "group": "navigation"
+        },
+        {
+          "command": "voxAiGuide.run",
+          "when": "view == voxAiGuide.home",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Vox AI Guide",
+      "properties": {
+        "voxAiGuide.statusBar.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the current Claude session's context size in the status bar."
+        },
+        "voxAiGuide.statusBar.warnAtTokens": {
+          "type": "number",
+          "default": 150000,
+          "description": "Context threshold past which the status bar switches to warning (a /clear or /compact starts to pay off)."
+        },
+        "voxAiGuide.library.path": {
+          "type": "string",
+          "default": "",
+          "description": "Folder holding your team's best-practice entries (Markdown files with a `slot:` header). Clone an internal repo there and everyone shares the same conventions. Empty falls back to ~/.claude/vox-library. Read locally, never fetched."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "test": "npm run compile && node test/nondisclosure.js",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.7.0"
+  },
+  "keywords": [
+    "copilot",
+    "claude",
+    "claude-code",
+    "tokens",
+    "cost",
+    "secrets",
+    "credentials",
+    "instructions",
+    "AGENTS.md",
+    "CLAUDE.md"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/plog/vox-ai-guide.git"
+  }
+}
