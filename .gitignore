@@ -10,6 +10,10 @@ out/
 .claude/settings.local.json
 .mcp.json
 
+# Internal-edition material that must never reach the public branch
+feedback/
+design/
+
 # OS / editor noise
 .DS_Store
 *.log
