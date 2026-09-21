@@ -28,6 +28,12 @@ function readHead(file: string, bytes: number): string {
   }
 }
 
+/**
+ * How much of a conversation's tail is enough to find its last recorded counters. Shared by
+ * the Claude transcript reader and the Copilot one so both keep the same bounded appetite.
+ */
+const TAIL_BYTES = 512 * 1024;
+
 /** Reads the trailing bytes of a file without loading all of it. */
 function readTail(file: string, bytes: number): string {
   const size = fs.statSync(file).size;
@@ -44,7 +50,7 @@ function readTail(file: string, bytes: number): string {
 
 /** Last recorded context size and model of one transcript, from its tail. */
 function tailContext(file: string): { contextTokens: number; model?: string } {
-  const lines = readTail(file, 512 * 1024).split('\n');
+  const lines = readTail(file, TAIL_BYTES).split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
     if (!line.startsWith('{')) {
@@ -88,6 +94,13 @@ function transcriptsByAge(dir: string): { file: string; mtime: number }[] {
 
 export interface SessionBrief {
   file: string;
+  /** The folder the chat ran in, from the transcript's own `cwd`. */
+  project?: string;
+  bytes?: number;
+  remote?: boolean;
+  projectMissing?: boolean;
+  /** Claude Code names each transcript after its session id — the handle to reopen the chat. */
+  id: string;
   label: string;
   contextTokens: number;
   model?: string;
@@ -102,25 +115,74 @@ export interface SessionBrief {
  */
 export function recentSessions(workspaceRoot: string, limit = 6): SessionBrief[] {
   const dir = projectTranscriptDir(workspaceRoot);
-  if (!dir) {
-    return [];
-  }
+  return dir ? sessionsInDir(dir, limit) : [];
+}
+
+/**
+ * The same reading, addressed by transcript directory rather than by project path. Listing
+ * every project needs this form: a directory name encodes its path with every non-alphanumeric
+ * character replaced by a dash, which cannot be decoded back into a path to look up again.
+ */
+function sessionsInDir(dir: string, limit: number): SessionBrief[] {
   let files: { file: string; mtime: number }[];
   try {
     files = transcriptsByAge(dir).slice(0, limit);
   } catch {
     return [];
   }
-  return files.map((f) => {
-    const { contextTokens, model } = tailContext(f.file);
-    return {
-      file: f.file,
-      label: chatLabel(f.file) ?? new Date(f.mtime).toLocaleDateString('en-GB'),
-      contextTokens,
-      model,
-      lastActivity: new Date(f.mtime),
-    };
-  });
+  return files.map((f) => sessionBrief(f.file, f.mtime));
+}
+
+/** One transcript read as a conversation summary: its tail for the counters, its head for the name. */
+function sessionBrief(file: string, mtime: number): SessionBrief {
+  const { contextTokens, model } = tailContext(file);
+  let bytes: number | undefined;
+  try {
+    bytes = fs.statSync(file).size;
+  } catch {
+    // Deleted since it was listed: its size is simply unknown.
+  }
+  return {
+    file,
+    id: path.basename(file, '.jsonl'),
+    label: chatLabel(file) ?? new Date(mtime).toLocaleDateString('en-GB'),
+    contextTokens,
+    model,
+    lastActivity: new Date(mtime),
+    bytes,
+    ...locate(transcriptCwd(file)),
+  };
+}
+
+/**
+ * What can be said about a conversation's folder. A folder that no longer exists is the
+ * clearest sign a chat has outlived its work — but only for local ones: a path on an SSH
+ * host or in a container cannot be checked from here, and calling it missing would be a lie.
+ */
+function locate(project: string | undefined): {
+  project?: string;
+  remote?: boolean;
+  projectMissing?: boolean;
+} {
+  if (!project) {
+    return {};
+  }
+  const remote = !path.isAbsolute(project) || /^[^/]+:\//.test(project);
+  return { project, remote, projectMissing: remote ? undefined : !exists(project) };
+}
+
+/**
+ * The folder a Claude chat ran in. Claude Code stamps `cwd` on its records, which is the
+ * only trustworthy source: the transcript *directory* name encodes the path with every
+ * non-alphanumeric character flattened to a dash, so `-Users-plog-my-app` could be `my-app`
+ * or `my.app` — unguessable. One bounded head read, alongside the one the label already does.
+ */
+function transcriptCwd(file: string): string | undefined {
+  try {
+    return /"cwd":"((?:[^"\\]|\\.){1,400})"/.exec(readHead(file, 16 * 1024))?.[1];
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -145,26 +207,26 @@ export function currentUsage(workspaceRoot: string): SessionUsage | undefined {
 
   const { contextTokens, model } = tailContext(newest.file);
 
-  const subagentsDir = path.join(
-    path.dirname(newest.file),
-    path.basename(newest.file, '.jsonl'),
-    'subagents',
-  );
-  let subagents = 0;
-  try {
-    subagents = fs.readdirSync(subagentsDir).length;
-  } catch {
-    subagents = 0;
-  }
-
   return {
     contextTokens,
     model,
     sessionFile: newest.file,
     label: chatLabel(newest.file),
     lastActivity: new Date(newest.mtime),
-    subagents,
+    subagents: subagentCount(newest.file),
   };
+}
+
+/** Sub-agents Claude Code spawned from one chat: one transcript each, in a sibling folder. */
+export function subagentCount(sessionFile: string): number {
+  try {
+    return fs.readdirSync(
+      path.join(path.dirname(sessionFile), path.basename(sessionFile, '.jsonl'), 'subagents'),
+    ).length;
+  } catch {
+    // No sub-agent was ever spawned from this chat, so the folder does not exist.
+    return 0;
+  }
 }
 
 // --- Where the week's tokens actually went -----------------------------------
@@ -690,6 +752,31 @@ function continueSpend(since: number): ToolSpend {
 
 /** A `file:///…` workspace URI from VSCode's workspace.json, as a comparable local path.
  *  Remote workspaces (`vscode-remote://…`) return undefined: their files are not this root. */
+/**
+ * A folder uri as a person reads it, remote ones included.
+ *
+ * Most of a developer's chats may not be local at all: VSCode records SSH hosts and
+ * containers as `vscode-remote://ssh-remote%2Bfury/projects/app`, which `folderUriToPath`
+ * rightly refuses — it answers "which local path is this", and there is none. Provenance
+ * asks a different question, "where was this held", and `fury:/projects/app` answers it.
+ */
+function folderLabel(uri: string): string | undefined {
+  const local = folderUriToPath(uri);
+  if (local) {
+    return local;
+  }
+  const m = /^vscode-remote:\/\/([^/]+)(\/.*)$/.exec(uri);
+  if (!m) {
+    return undefined;
+  }
+  const authority = decodeURIComponent(m[1]);
+  // `attached-container+<hex>@ssh-remote+host`: the container's name is hex-encoded JSON,
+  // and the host it runs on follows the @. Show the host, which is what situates the work.
+  const host = authority.split('@').pop() ?? authority;
+  const name = host.replace(/^(ssh-remote|dev-container|attached-container|wsl)\+/, '');
+  return `${name}:${m[2]}`;
+}
+
 function folderUriToPath(uri: string): string | undefined {
   if (!uri.startsWith('file://')) {
     return undefined;
@@ -763,33 +850,46 @@ function harvestCopilotRequests(node: unknown, into: Map<string, CopilotRequest>
 }
 
 const COPILOT_SESSION_MAX_BYTES = 8 * 1024 * 1024;
+const COPILOT_TAIL_BYTES = 64 * 1024;
+const COPILOT_HEAD_BYTES = 16 * 1024;
 
 /**
- * Copilot, measured from VSCode's own chat archive. Copilot Chat exposes no supported local
- * API — but VSCode persists every chat session under workspaceStorage/<hash>/chatSessions/,
- * and since mid-2026 each request carries promptTokens/outputTokens and the resolved model.
- * Same epistemic status as Claude's transcripts: an on-disk artifact, read locally.
- * Requests older than the counter (or cancelled/errored) have no counts — the `note` says
- * how many did, so a partial measurement never poses as a complete one.
+ * Where VSCode archives the chats that belong to this window: under the workspace's own
+ * storage folder when a folder is open, and in globalStorage/emptyWindowChatSessions when
+ * none is — those chats belong to no project, so they answer for exactly the case that has
+ * none. Shared by the spend total and the conversation list so the two can never disagree.
  */
-function copilotSpend(workspaceRoot: string | undefined, since: number): ToolSpend {
-  const out: ToolSpend = {
-    tool: 'GitHub Copilot',
-    measurable: false,
-    reason: 'no VSCode chat archive found for this project',
-    inputTokens: 0,
-    outputTokens: 0,
-    weighted: 0,
-    models: [],
-    calls: 0,
-    share: 0,
-  };
-  if (!workspaceRoot) {
-    return out;
-  }
-
-  const sessionDirs: string[] = [];
+function copilotSessionDirs(workspaceRoot: string | undefined, everywhere = false): string[] {
+  const dirs: string[] = [];
   for (const userDir of vscodeUserDirs()) {
+    if (everywhere) {
+      // Every project's archive plus the folderless one: the conversation list shows all of
+      // them, because a chat left open in another window is still a chat you are paying for.
+      const orphans = path.join(userDir, 'globalStorage', 'emptyWindowChatSessions');
+      if (exists(orphans)) {
+        dirs.push(orphans);
+      }
+      let all: string[] = [];
+      try {
+        all = fs.readdirSync(path.join(userDir, 'workspaceStorage'));
+      } catch {
+        continue;
+      }
+      for (const hash of all) {
+        const dir = path.join(userDir, 'workspaceStorage', hash, 'chatSessions');
+        if (exists(dir)) {
+          dirs.push(dir);
+        }
+      }
+      continue;
+    }
+    if (!workspaceRoot) {
+      const orphans = path.join(userDir, 'globalStorage', 'emptyWindowChatSessions');
+      if (exists(orphans)) {
+        dirs.push(orphans);
+      }
+      continue;
+    }
     const storage = path.join(userDir, 'workspaceStorage');
     let hashes: string[] = [];
     try {
@@ -807,10 +907,36 @@ function copilotSpend(workspaceRoot: string | undefined, since: number): ToolSpe
       }
       const folder = meta.folder && folderUriToPath(meta.folder);
       if (folder && samePath(folder, workspaceRoot) && exists(path.join(dir, 'chatSessions'))) {
-        sessionDirs.push(path.join(dir, 'chatSessions'));
+        dirs.push(path.join(dir, 'chatSessions'));
       }
     }
   }
+  return dirs;
+}
+
+/**
+ * Copilot, measured from VSCode's own chat archive. Copilot Chat exposes no supported local
+ * API — but VSCode persists every chat session under workspaceStorage/<hash>/chatSessions/,
+ * and since mid-2026 each request carries promptTokens/outputTokens and the resolved model.
+ * Same epistemic status as Claude's transcripts: an on-disk artifact, read locally.
+ * Requests older than the counter (or cancelled/errored) have no counts — the `note` says
+ * how many did, so a partial measurement never poses as a complete one.
+ */
+function copilotSpend(workspaceRoot: string | undefined, since: number): ToolSpend {
+  const out: ToolSpend = {
+    tool: 'GitHub Copilot',
+    measurable: false,
+    reason: workspaceRoot
+      ? 'no VSCode chat archive found for this project'
+      : 'no VSCode chat archive found for windows without a folder',
+    inputTokens: 0,
+    outputTokens: 0,
+    weighted: 0,
+    models: [],
+    calls: 0,
+    share: 0,
+  };
+  const sessionDirs = copilotSessionDirs(workspaceRoot);
 
   const requests = new Map<string, CopilotRequest>();
   for (const dir of sessionDirs) {
@@ -1020,4 +1146,320 @@ export function crossToolSpend(workspaceRoot?: string, days = 7): ToolSpend[] {
   return out
     .map((t) => ({ ...t, share: grand ? Math.round((t.weighted / grand) * 100) : 0 }))
     .sort((a, b) => b.weighted - a.weighted);
+}
+
+// --- One list, every tool -----------------------------------------------------
+// The status bar shows a single figure, so it needs a single list to choose from. Claude,
+// Copilot and Codex each keep their own archive in their own shape; what follows normalises
+// the three into one row type. Only what is recorded is reported: a tool that writes no
+// counter contributes nothing rather than a guess.
+
+export interface Conversation {
+  /** 'Claude' | 'Copilot' | 'Codex' — shown as the row's group, and half of the pin key. */
+  tool: string;
+  id: string;
+  label: string;
+  contextTokens: number;
+  model?: string;
+  lastActivity: Date;
+  /** Claude only: the transcript, for the sub-agent count and `/compact`. */
+  file?: string;
+  /**
+   * Where the conversation was held, as a person reads it — a local path, or `host:/path`
+   * for an SSH or container workspace. Without it a list spanning every project is
+   * unreadable: a title alone does not say which repository it belongs to, and the machine
+   * holds hundreds. Undefined when the tool recorded none — a chat opened with no folder.
+   */
+  project?: string;
+  /** Bytes this conversation occupies on disk — what cleaning it up would give back. */
+  bytes?: number;
+  /** The folder is on another machine: its existence cannot be checked from here. */
+  remote?: boolean;
+  /** The folder no longer exists locally — the clearest sign a chat has outlived its work. */
+  projectMissing?: boolean;
+}
+
+/**
+ * Every Copilot archive on this machine, each with the folder it belongs to. VSCode files a
+ * chat under its workspace's storage folder, whose sibling `workspace.json` names the folder
+ * — so provenance is read there, once per directory, not once per chat.
+ */
+function copilotArchives(
+  workspaceRoot: string | undefined,
+  everywhere = false,
+): { file: string; project?: string }[] {
+  const out: { file: string; project?: string }[] = [];
+  for (const dir of copilotSessionDirs(workspaceRoot, everywhere)) {
+    let project: string | undefined;
+    try {
+      const meta = JSON.parse(
+        fs.readFileSync(path.join(path.dirname(dir), 'workspace.json'), 'utf8'),
+      ) as { folder?: string };
+      project = meta.folder ? folderLabel(meta.folder) : undefined;
+    } catch {
+      // emptyWindowChatSessions, or metadata we cannot read: the chat belongs to no folder.
+    }
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (/\.jsonl?$/.test(name)) {
+          out.push({ file: path.join(dir, name), project });
+        }
+      }
+    } catch {
+      // Storage folder removed between listing and reading: nothing to report for it.
+    }
+  }
+  return out;
+}
+
+/** One Copilot archive read as a conversation, or undefined when it records no counter. */
+function copilotConversation(file: string, project?: string): Conversation | undefined {
+  let mtime: number;
+  let bytes: number;
+  try {
+    const st = fs.statSync(file);
+    mtime = st.mtimeMs;
+    bytes = st.size;
+  } catch {
+    return undefined;
+  }
+  const tail = copilotTailContext(file);
+  if (!tail) {
+    return undefined;
+  }
+  const name = path.basename(file);
+  return {
+    tool: 'Copilot',
+    id: path.basename(name, path.extname(name)),
+    // The title is written near the top; the counters at the end. Two bounded reads, and
+    // never the middle of the file — which is the megabytes of conversation itself.
+    label: copilotChatLabel(readHead(file, COPILOT_HEAD_BYTES)) ?? new Date(mtime).toLocaleDateString('en-GB'),
+    contextTokens: tail.tokens,
+    model: tail.model,
+    lastActivity: new Date(mtime),
+    bytes,
+    ...locate(project),
+  };
+}
+
+/**
+ * How big a Copilot conversation currently is, and the model serving it — read from the end
+ * of its archive, exactly as `tailContext()` does for a Claude transcript.
+ *
+ * The figure is the *last* request's prompt, not the largest: Copilot rebuilds the whole
+ * prompt every turn, so the most recent one is the size the next turn will pay for, which is
+ * the question the status bar asks. It also happens to be the cheap one to answer — reading
+ * two numbers out of the tail instead of parsing megabytes of archive.
+ *
+ * Scanned textually rather than parsed: `harvestCopilotRequests` walks the whole document and
+ * is right for the spend total, which needs every request's timestamp. Here a regex answers
+ * the same question without building the object graph.
+ */
+function copilotTailContext(file: string): { tokens: number; model?: string } | undefined {
+  const last = <T>(raw: string, re: RegExp, pick: (m: RegExpExecArray) => T): T | undefined => {
+    let found: T | undefined;
+    for (let m = re.exec(raw); m; m = re.exec(raw)) {
+      found = pick(m);
+    }
+    return found;
+  };
+
+  // Escalating read: a small tail answers for almost every archive, and paying the large one
+  // for all of them costs hundreds of megabytes of I/O. A chat whose last counters sit
+  // further back — a long run of tool calls since — gets the full read rather than being
+  // dropped from the list, which would be a silent hole in "every conversation".
+  for (const bytes of [COPILOT_TAIL_BYTES, TAIL_BYTES]) {
+    let raw: string;
+    try {
+      raw = readTail(file, bytes);
+    } catch {
+      return undefined;
+    }
+    const tokens = last(raw, /"promptTokens":(\d+)/g, (m) => Number(m[1]));
+    if (tokens) {
+      return { tokens, model: last(raw, /"resolvedModel":"([^"]{1,80})"/g, (m) => m[1]) };
+    }
+    if (raw.length < bytes) {
+      break; // The whole file was read: a larger request would return the same bytes.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * A name for a Copilot chat: VSCode stores a `customTitle` once the session has one. The
+ * search is textual and bounded — the archive is a large, undocumented, VSCode-internal
+ * document, and walking it whole to find one string would cost more than the name is worth.
+ */
+function copilotChatLabel(raw: string): string | undefined {
+  const m = /"(?:customTitle|title)":"((?:[^"\\]|\\.){1,120})"/.exec(raw);
+  if (!m) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(`"${m[1]}"`) as string;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Codex threads, one row each. Its `threads` table records tokens_used per conversation. */
+function codexConversations(workspaceRoot: string | undefined, everywhere = false): Conversation[] {
+  let stateFile: string | undefined;
+  try {
+    stateFile = fs
+      .readdirSync(codexUserDir())
+      .filter((n) => /^state_\d+\.sqlite$/.test(n))
+      .sort((a, b) => parseInt(b.slice(6), 10) - parseInt(a.slice(6), 10))
+      .map((n) => path.join(codexUserDir(), n))[0];
+  } catch {
+    return [];
+  }
+  if (!stateFile) {
+    return [];
+  }
+
+  let db: SqliteDb | undefined;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync } = require('node:sqlite');
+    db = new DatabaseSync(stateFile, { readOnly: true }) as SqliteDb;
+    const rows = db
+      .prepare(
+        'SELECT id, title, cwd, model, tokens_used AS tokens, ' +
+          'COALESCE(updated_at_ms, updated_at * 1000) AS ts ' +
+          'FROM threads WHERE tokens_used > 0 AND archived = 0 ORDER BY ts DESC LIMIT 50',
+      )
+      .all() as { id: string; title: string; cwd: string; model: string | null; tokens: number; ts: number }[];
+    return rows
+      .filter((r) => everywhere || !workspaceRoot || samePath(r.cwd, workspaceRoot))
+      .map((r) => ({
+      tool: 'Codex',
+      id: r.id,
+      label: r.title || new Date(r.ts).toLocaleDateString('en-GB'),
+      contextTokens: r.tokens,
+      model: r.model ?? undefined,
+      lastActivity: new Date(r.ts),
+      ...locate(r.cwd || undefined),
+    }));
+  } catch {
+    // No node:sqlite, database busy, or a schema that has moved on: report nothing.
+    return [];
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // Closing a database that never opened is not an error worth reporting.
+    }
+  }
+}
+
+/**
+ * Every conversation this window can account for, across tools, newest first. This is what
+ * the status bar picks from: one figure on screen means one list to choose it in.
+ */
+export async function recentConversations(
+  workspaceRoot: string | undefined,
+  opts: {
+    onProgress?: (soFar: Conversation[]) => void;
+    /**
+     * 'project' — only chats held in this folder, which is what the status bar is about.
+     * 'everywhere' — every project on the machine, which only the cleanup screen wants:
+     * there the question is what the archives weigh in total, not what is open here.
+     */
+    scope?: 'project' | 'everywhere';
+    perTool?: number;
+  } = {},
+): Promise<Conversation[]> {
+  const { onProgress, scope = 'project', perTool = 25 } = opts;
+  const everywhere = scope === 'everywhere';
+  const found: Conversation[] = [];
+  const publish = (): void => {
+    found.sort((a, b) => b.lastActivity.getTime() - a.lastActivity.getTime());
+    onProgress?.(found);
+  };
+
+  // Claude first, and cheaply: a handful of tail reads per directory. The picker can already
+  // be useful while the rest arrives.
+  const claude = new Map<string, Conversation>();
+  for (const dir of claudeTranscriptDirs(workspaceRoot, everywhere)) {
+    for (const s of sessionsInDir(dir, perTool)) {
+      // Keyed by id: the current project is read first and again as one of the directories.
+      claude.set(s.id, { tool: 'Claude', ...s, id: s.id });
+    }
+  }
+  found.push(...[...claude.values()].filter((c) => c.contextTokens > 0));
+  publish();
+
+  // Copilot is the expensive half — hundreds of archives, megabytes each. Reading them in
+  // batches with a yield between lets the extension host serve everything else meanwhile:
+  // a list that takes a second to fill is fine, a VSCode frozen for a second is not.
+  const archives = copilotArchives(workspaceRoot, everywhere);
+  for (let i = 0; i < archives.length; i += COPILOT_BATCH) {
+    for (const a of archives.slice(i, i + COPILOT_BATCH)) {
+      const c = copilotConversation(a.file, a.project);
+      if (c && c.contextTokens > 0) {
+        found.push(c);
+      }
+    }
+    publish();
+    await new Promise((r) => setImmediate(r));
+  }
+
+  found.push(...codexConversations(workspaceRoot, everywhere).filter((c) => c.contextTokens > 0));
+  publish();
+  return found;
+}
+
+/** Archives read between two yields — small enough that no single batch is felt. */
+const COPILOT_BATCH = 25;
+
+/**
+ * One conversation, addressed directly. The status bar needs this when the user has pinned a
+ * Copilot or Codex chat: re-listing hundreds of archives every minute to find one of them
+ * would be exactly the cost the batched listing above exists to avoid.
+ */
+export function conversationById(
+  tool: string,
+  id: string,
+  workspaceRoot: string | undefined,
+): Conversation | undefined {
+  if (tool === 'Claude') {
+    for (const dir of claudeTranscriptDirs(workspaceRoot, true)) {
+      const file = path.join(dir, `${id}.jsonl`);
+      try {
+        return { tool: 'Claude', ...sessionBrief(file, fs.statSync(file).mtimeMs) };
+      } catch {
+        // Not this project's transcript: try the next directory.
+      }
+    }
+    return undefined;
+  }
+  if (tool === 'Copilot') {
+    // Pinning reaches across projects, so the lookup must too.
+    const a = copilotArchives(workspaceRoot, true).find(
+      (x) => path.basename(x.file, path.extname(x.file)) === id,
+    );
+    return a ? copilotConversation(a.file, a.project) : undefined;
+  }
+  return codexConversations(workspaceRoot, true).find((c) => c.id === id);
+}
+
+/** This project's transcript directory, and — for the cleanup screen only — every other. */
+function claudeTranscriptDirs(workspaceRoot: string | undefined, everywhere: boolean): string[] {
+  const here = workspaceRoot ? projectTranscriptDir(workspaceRoot) : undefined;
+  if (!everywhere) {
+    return here ? [here] : [];
+  }
+  const root = path.join(claudeUserDir(), 'projects');
+  let others: string[] = [];
+  try {
+    others = fs
+      .readdirSync(root, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => path.join(root, d.name));
+  } catch {
+    // No transcript folder at all: a machine where Claude Code has never run.
+  }
+  return here ? [here, ...others] : others;
 }

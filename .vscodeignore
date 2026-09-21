@@ -9,3 +9,7 @@ test/**
 *.vsix
 .env
 .env.*
+
+# Screenshots showing real conversation titles: kept locally, never shipped.
+media/screenshots/fixes.png
+media/screenshots/status-chats.png

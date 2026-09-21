@@ -150,7 +150,9 @@ async function onMessage(msg: {
         // The dev should not need to learn `paths:` and `applyTo:` — the AI already knows
         // them. We hand over a precise work order instead of a lesson.
         const loaded = scan(ctx.workspaceRoot)
-          .instructions.filter((f) => f.present && f.loaded && f.lines > 0)
+          .instructions.filter(
+            (f) => f.present && f.loaded && f.lines > 0 && !f.onDemand && f.reader !== 'other',
+          )
           .sort((a, b) => b.lines - a.lines);
         const fat = loaded[0];
         if (!fat) {
@@ -212,7 +214,7 @@ function render(): void {
     const fix = FIXES.find((f) => f.id === wanted);
     if (fix) {
       // The review screen stands alone: no map behind it, nothing else to click.
-      panel.webview.html = shell(reviewScreen(fix, ctx, logos()));
+      panel.webview.html = shell(`<main>${reviewScreen(fix, ctx, logos())}</main>`);
       return;
     }
     focus = { mode: 'map' };
@@ -283,11 +285,23 @@ function zoneChip(file: string): string {
 }
 
 function readerBadge(f: InstructionFile): string {
-  const map = { claude: 'Claude', copilot: 'Copilot', both: 'Both' };
+  const map: Record<InstructionFile['reader'], string> = {
+    claude: 'Claude',
+    copilot: 'Copilot',
+    both: 'Both',
+    other: 'Other tool',
+  };
   return `<span class="badge ${f.reader}">${map[f.reader]}</span>`;
 }
 
 function fileState(f: InstructionFile): string {
+  // Third-party files: we can say they are here, never that the tool that reads them ran.
+  if (f.reader === 'other') {
+    return f.present ? '<span class="ok">present</span>' : '<span class="dim">absent</span>';
+  }
+  if (f.present && f.onDemand) {
+    return `<span class="ondemand">on demand</span>${f.lines ? ` <span class="dim">${f.lines} ln</span>` : ''}`;
+  }
   return !f.present
     ? '<span class="dim">missing</span>'
     : f.loaded
@@ -300,24 +314,44 @@ function fileState(f: InstructionFile): string {
  * top to bottom, so position is a fact. Copilot combines its files with no documented
  * order, so its chain shows a "+" instead of inventing ranks.
  */
-function chainRows(files: InstructionFile[], ordered: boolean): string {
-  const rows = files.map((f, i) => {
+function chainRows(files: InstructionFile[], ordered: boolean, total = true): string {
+  // Only the always-loaded files get a rank: they are the ones stacked into every prompt.
+  // The on-demand ones sit in the same table because that is where people look for them,
+  // marked with a dot so the numbered chain stays readable.
+  let rank = 0;
+  const rows = files.map((f) => {
+    const n = f.onDemand ? '·' : ordered ? String(++rank) : '+';
     const gate = f.gatedBy ? `<div class="dim small">only if <code>${esc(f.gatedBy)}</code> is on</div>` : '';
     const note = f.note ? `<div class="dim small">${esc(f.note)}</div>` : '';
     const shared = f.reader === 'both' ? ` ${readerBadge(f)}` : '';
     return `<tr class="${f.present && f.loaded ? '' : 'chain-off'}">
-      <td class="rank"><span class="rankn">${ordered ? i + 1 : '+'}</span></td>
+      <td class="rank"><span class="rankn${f.onDemand ? ' opt' : ''}">${n}</span></td>
       <td>${zoneChip(f.file)} <strong>${esc(f.label)}</strong>${shared}<div class="dim small mono">${esc(f.file || '—')}</div>${gate}${note}</td>
       <td class="scope">${esc(f.scope)}</td>
       <td class="state">${fileState(f)}</td>
     </tr>`;
   });
-  const lines = files.filter((f) => f.present && f.loaded).reduce((n, f) => n + f.lines, 0);
+  // On-demand files are deliberately excluded: counting them here would tell the user they
+  // pay for a skill they never invoked, which is the opposite of the lesson.
+  const lines = files
+    .filter((f) => f.present && f.loaded && !f.onDemand)
+    .reduce((n, f) => n + f.lines, 0);
+  // A table with no column headers is a list of unlabelled facts — the single biggest reason
+  // these panes read as a dump. The header names the three questions each row answers.
+  const head = `<thead><tr>
+      <th class="rank">${ordered ? '#' : ''}</th>
+      <th>File</th><th class="scope">Who it reaches</th><th class="state">State</th>
+    </tr></thead>`;
+  if (!total) {
+    // The on-demand and third-party tables are inventories, not a stack: no prompt is being
+    // assembled here, so a "one single prompt" footer would be a lie.
+    return `${head}<tbody>${rows.join('')}</tbody>`;
+  }
   rows.push(`<tr class="chain-sum">
     <td class="rank"><span class="rankn sum">=</span></td>
     <td colspan="3">one single prompt${lines ? ` — <strong>${lines.toLocaleString('en-GB')} lines</strong> from the files above` : ''}, sent again on <em>every</em> turn</td>
   </tr>`);
-  return rows.join('');
+  return `${head}<tbody>${rows.join('')}</tbody>`;
 }
 
 const EXPOSURE_LABEL: Record<Finding['exposure'], string> = {
@@ -475,7 +509,7 @@ function picker(slot: Slot, workspaceRoot?: string): string {
 }
 
 function vscodeRows(settings: ScanResult['vscode']): string {
-  return settings
+  const rows = settings
     .map((s) => {
       const val = s.effective === undefined ? '—' : JSON.stringify(s.effective);
       const over = s.overridden.length
@@ -489,6 +523,8 @@ function vscodeRows(settings: ScanResult['vscode']): string {
       </tr>`;
     })
     .join('');
+  return `<thead><tr><th>Layer that wins</th><th>Setting</th>
+    <th class="state">Effective value</th></tr></thead><tbody>${rows}</tbody>`;
 }
 
 /**
@@ -498,7 +534,9 @@ function vscodeRows(settings: ScanResult['vscode']): string {
  */
 function dietSection(result: ScanResult): string {
   const loaded = result.instructions
-    .filter((f) => f.present && f.loaded && f.lines > 0)
+    // Only what is re-sent on every turn: on-demand files cost nothing until used, and a
+    // third-party file is another tool's bill, not this session's.
+    .filter((f) => f.present && f.loaded && f.lines > 0 && !f.onDemand && f.reader !== 'other')
     .sort((a, b) => b.lines - a.lines);
 
   const total = (reader: 'claude' | 'copilot') =>
@@ -592,7 +630,9 @@ function reportSection(
 
   sec('Instruction files — re-sent with every request');
   const loaded = result.instructions
-    .filter((f) => f.present && f.loaded && f.lines > 0)
+    // Only what is re-sent on every turn: on-demand files cost nothing until used, and a
+    // third-party file is another tool's bill, not this session's.
+    .filter((f) => f.present && f.loaded && f.lines > 0 && !f.onDemand && f.reader !== 'other')
     .sort((a, b) => b.lines - a.lines);
   if (!loaded.length) {
     ok('no always-loaded instruction file: every request starts lean');
@@ -892,6 +932,49 @@ function html(
        </div>`
     : '<div class="callout">No Claude session detected for this folder.</div>';
 
+  // The page opened on a wall of prose and made you read to find out whether anything was
+  // wrong. Four figures answer that before the first scroll — each one the subject of a tab.
+  const alwaysLoaded = result.instructions.filter(
+    (f) => f.present && f.loaded && !f.onDemand && f.reader !== 'other',
+  );
+  const promptLines = alwaysLoaded.reduce((n, f) => n + f.lines, 0);
+  const grave = findings.filter((f) => f.severity === 'critical' || f.severity === 'high').length;
+  const tile = (
+    value: string,
+    label: string,
+    tone: 'ok' | 'warn' | 'danger' | 'plain',
+    to: Tab,
+  ) => `<button class="tile tone-${tone}" data-tab="${to}">
+      <span class="tile-v">${esc(value)}</span>
+      <span class="tile-l">${esc(label)}</span>
+    </button>`;
+  const stats = `<div class="tiles">
+    ${tile(
+      String(findings.length),
+      findings.length === 1 ? 'secret in your config' : 'secrets in your config',
+      findings.length === 0 ? 'ok' : grave ? 'danger' : 'warn',
+      'secrets',
+    )}
+    ${tile(
+      String(fixes.length),
+      fixes.length === 1 ? 'fix suggested' : 'fixes suggested',
+      fixes.length === 0 ? 'ok' : 'warn',
+      'fixes',
+    )}
+    ${tile(
+      promptLines.toLocaleString('en-GB'),
+      'lines re-sent every turn',
+      promptLines > 400 ? 'warn' : 'plain',
+      'files',
+    )}
+    ${tile(
+      usage ? `${Math.round(usage.contextTokens / 1000)}k` : '—',
+      'context in this chat',
+      usage && usage.contextTokens > 120000 ? 'warn' : 'plain',
+      'report',
+    )}
+  </div>`;
+
   // Counts on the tabs, so the bar says what it holds before you click it.
   const counts: Partial<Record<Tab, number>> = {
     secrets: findings.length,
@@ -962,15 +1045,43 @@ function html(
       <em>add to</em> earlier ones; nothing cancels anything. Present is not the same as loaded —
       watch the last column.</p>
       <table>${chainRows(
-        result.instructions.filter((f) => f.reader === 'claude' || f.reader === 'both'),
+        result.instructions.filter(
+          (f) => (f.reader === 'claude' || f.reader === 'both') && !f.onDemand,
+        ),
         true,
+      )}</table>
+
+      <h3>Loaded on demand — the way to stop paying for everything, every turn</h3>
+      <p class="lede small">These are read only when something calls for them: a skill used, a
+      sub-agent spawned, a <code>/command</code> typed. Only their name and one-line description
+      sit in the permanent context. Anything in your CLAUDE.md that only matters now and then
+      belongs here instead.</p>
+      <table>${chainRows(
+        result.instructions.filter((f) => f.onDemand && f.reader !== 'other'),
+        false,
+        false,
       )}</table>
 
       <h3>What Copilot reads — all combined, no pecking order</h3>
       <p class="lede small">Copilot merges these too. Half of them only exist for it if a VSCode
       setting says so — that is where "present but ignored" comes from.</p>
       <table>${chainRows(
-        result.instructions.filter((f) => f.reader === 'copilot' || f.reader === 'both'),
+        result.instructions.filter(
+          (f) => (f.reader === 'copilot' || f.reader === 'both') && !f.onDemand,
+        ),
+        false,
+      )}</table>
+
+      <h3>What the rest of the ecosystem reads</h3>
+      <p class="lede small">You are not the only reader of this repo. These files steer Cursor,
+      Windsurf, Cline, Gemini, Zed, Aider and the others — a teammate on another tool is being
+      instructed by whichever of these is committed, even if you never open it. Two things to
+      know: <strong>AGENTS.md</strong> is the shared standard several of these agree on, and a
+      stale <code>.cursorrules</code> can win over it, because some editors take the
+      <em>first</em> file they find rather than merging them all.</p>
+      <table>${chainRows(
+        result.instructions.filter((f) => f.reader === 'other'),
+        false,
         false,
       )}</table>`,
 
@@ -1012,12 +1123,19 @@ function html(
       ).join('')}`,
   };
 
+  // The header holds still while the pane scrolls under it: with five tabs and long panes,
+  // losing the tab strip at the first scroll is what made the page feel like a dump.
   return shell(`
+<header class="topbar">
 ${brand(logo, 'Your AI configuration')}
+<p class="tagline">Every file and setting that shapes what the AI in this window does — where
+it lives, who else it reaches, and what it costs you on each turn.</p>
+${stats}
 <nav class="tabs">${nav}
   <button class="tab refresh" data-refresh title="Re-run every scan and measurement" aria-label="Scan again"><span class="glyph">⟳</span> Scan again</button>
 </nav>
-${panes[tab]}
+</header>
+<main>${panes[tab]}</main>
 `);
 }
 
@@ -1045,25 +1163,75 @@ function shell(body: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <style nonce="${n}">
+  :root {
+    --edge: var(--vscode-widget-border, rgba(128,128,128,0.22));
+    --surface: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+    --dim: var(--vscode-descriptionForeground);
+  }
+  * { box-sizing: border-box; }
   body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size, 13px);
          color: var(--vscode-foreground);
-         padding: 20px 24px; max-width: 980px; line-height: 1.5; }
+         /* No padding-top: the header owns the top edge so it can stay put while we scroll. */
+         padding: 0 26px 48px; max-width: 1020px; margin: 0 auto; line-height: 1.55; }
   button:focus-visible, textarea:focus-visible, select:focus-visible {
     outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px;
   }
-  h1 { font-size: 1.38em; margin: 0 0 4px; }
-  .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  /* Bleeds to the window edge through the body's side padding, so the sticky bar reads as
+     chrome rather than as one more block in the column. */
+  .topbar { position: sticky; top: 0; z-index: 5;
+            margin: 0 -26px 22px; padding: 18px 26px 0;
+            background: var(--vscode-editor-background);
+            border-bottom: 1px solid var(--edge); }
+  main { display: block; }
+  .tagline { color: var(--dim); margin: 2px 0 0; max-width: 72ch; }
+
+  /* The answer before the question: four figures, each one a door to its tab. */
+  .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+           gap: 10px; margin: 16px 0 4px; }
+  @media (max-width: 720px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  button.tile { display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+                text-align: left; padding: 11px 13px; border-radius: 10px;
+                border: 1px solid var(--edge); background: var(--surface);
+                color: var(--vscode-foreground); cursor: pointer; }
+  button.tile:hover { border-color: var(--vscode-focusBorder); }
+  .tile-v { font-size: 1.72em; font-weight: 650; line-height: 1.1; letter-spacing: -0.02em;
+            font-variant-numeric: tabular-nums; }
+  .tile-l { font-size: 0.85em; color: var(--dim); line-height: 1.3; }
+  /* Tone on the figure only. A coloured card for every tile would make the page shout;
+     the eye should land on the one that is not fine. */
+  .tone-ok .tile-v { color: var(--vscode-charts-green); }
+  .tone-warn .tile-v { color: var(--vscode-charts-yellow); }
+  .tone-danger .tile-v { color: var(--vscode-charts-red); }
+  .tone-danger { border-color: color-mix(in srgb, var(--vscode-charts-red) 45%, transparent);
+                 background: color-mix(in srgb, var(--vscode-charts-red) 8%, var(--surface)); }
+  h1 { font-size: 1.5em; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 4px; }
+  .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 2px; }
   .brand h1 { margin: 0; }
   .logo { height: 34px; width: auto; }
   /* VSCode puts vscode-light / vscode-dark / vscode-high-contrast on the body. */
   .logo-dark { display: none; }
   body.vscode-dark .logo-dark, body.vscode-high-contrast .logo-dark { display: block; }
   body.vscode-dark .logo-light, body.vscode-high-contrast .logo-light { display: none; }
-  h2 { font-size: 1.08em; margin: 28px 0 10px; text-transform: uppercase; letter-spacing: .06em;
-       color: var(--vscode-descriptionForeground); }
-  .lede { color: var(--vscode-descriptionForeground); margin: 0 0 8px; }
-  table { border-collapse: collapse; width: 100%; }
-  td { padding: 8px 10px; border-bottom: 1px solid var(--vscode-panel-border); vertical-align: top; }
+  /* Uppercase grey for a heading turns every section into a shouted label. A section title
+     is a title: full contrast, normal case, with the rule doing the separating. */
+  h2 { font-size: 1.18em; font-weight: 600; letter-spacing: -0.01em;
+       margin: 34px 0 6px; padding-top: 14px;
+       color: var(--vscode-foreground); border-top: 1px solid var(--edge); }
+  h2:first-child { margin-top: 4px; padding-top: 0; border-top: 0; }
+  .lede { color: var(--dim); margin: 0 0 14px; max-width: 78ch; }
+  /* Tables are the bulk of this page: give them a frame so a pane reads as a few objects
+     instead of one uninterrupted wall of rows. */
+  table { border-collapse: separate; border-spacing: 0; width: 100%;
+          background: var(--surface); border: 1px solid var(--edge);
+          border-radius: 10px; overflow: hidden; margin: 0 0 18px; }
+  th { text-align: left; padding: 8px 12px; font-size: 0.78em; font-weight: 600;
+       letter-spacing: 0.06em; text-transform: uppercase; color: var(--dim);
+       background: var(--vscode-editor-background);
+       border-bottom: 1px solid var(--edge); white-space: nowrap; }
+  th.state { text-align: right; }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--edge); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:hover td { background: var(--vscode-list-hoverBackground, transparent); }
   td:first-child { width: 78px; }
   .scope { color: var(--vscode-descriptionForeground); width: 30%; }
   .state { text-align: right; white-space: nowrap; }
@@ -1091,7 +1259,8 @@ function shell(body: string): string {
   /* The two opposite rules of the maze, side by side — the whole lesson in one glance. */
   .rules2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0 16px; }
   @media (max-width: 640px) { .rules2 { grid-template-columns: 1fr; } }
-  .rulecard { border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.25)); border-radius: 6px; padding: 12px 14px; }
+  .rulecard { border: 1px solid var(--edge); border-radius: 10px; padding: 14px 16px;
+              background: var(--surface); }
   .rulecard p { margin: 6px 0 0; color: var(--vscode-descriptionForeground); font-size: 0.92em; }
   .rule-title { font-weight: 600; }
   .rule-demo { margin-top: 4px; color: var(--vscode-textLink-foreground); font-size: 0.9em; }
@@ -1105,7 +1274,8 @@ function shell(body: string): string {
 
   /* The override ladder: strongest on top, and the arrow says so between every rung. */
   .ladder { margin: 8px 0 16px; }
-  .rung { display: flex; align-items: baseline; gap: 10px; padding: 8px 10px; border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.25)); border-radius: 6px; }
+  .rung { display: flex; align-items: baseline; gap: 10px; padding: 10px 12px;
+          border: 1px solid var(--edge); border-radius: 8px; background: var(--surface); }
   .rung-off { opacity: 0.55; }
   .rung-body { flex: 1; min-width: 0; }
   .rung-body .mono { display: block; overflow-wrap: anywhere; }
@@ -1129,12 +1299,17 @@ function shell(body: string): string {
            border: 1px solid var(--vscode-panel-border);
            color: var(--vscode-descriptionForeground); }
   .rankn.sum { border-color: var(--vscode-charts-green); color: var(--vscode-charts-green); }
+  /* No rank: these files are not rungs of the stack, they are called when needed. */
+  .rankn.opt { border-style: dashed; }
+  .ondemand { color: var(--vscode-charts-blue); }
   tr.chain-off > td:not(.state) { opacity: 0.55; }
-  tr.chain-sum td { border-bottom: 0; color: var(--vscode-descriptionForeground); }
+  tr.chain-sum td { border-bottom: 0; color: var(--dim);
+                    background: var(--vscode-editor-background); }
   .badge { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 0.77em;
            border: 1px solid var(--vscode-panel-border); }
   .badge.both { border-color: var(--vscode-charts-green); color: var(--vscode-charts-green); }
-  .callout { border-left: 3px solid var(--vscode-charts-yellow); padding: 8px 12px; margin: 8px 0;
+  .callout { border-left: 3px solid var(--vscode-charts-yellow); border-radius: 0 8px 8px 0;
+             padding: 10px 14px; margin: 12px 0;
              background: var(--vscode-textBlockQuote-background); }
   .ok-callout { border-left-color: var(--vscode-charts-green); }
   .danger { border-left-color: var(--vscode-charts-red); }
@@ -1145,7 +1320,8 @@ function shell(body: string): string {
   .sev-low  { color: var(--vscode-descriptionForeground); }
   button.ghost { background: transparent; color: var(--vscode-foreground);
                  border: 1px solid var(--vscode-panel-border); margin-left: 4px; }
-  .fix { border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 12px 14px; margin: 10px 0; }
+  .fix { border: 1px solid var(--edge); border-radius: 10px; padding: 14px 16px; margin: 12px 0;
+         background: var(--surface); }
   .fix-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
   .fix p { margin: 8px 0 0; color: var(--vscode-descriptionForeground); }
   .gain { color: var(--vscode-charts-green) !important; }
@@ -1181,19 +1357,22 @@ function shell(body: string): string {
   .notes li { padding-left: 18px; position: relative; margin: 3px 0; }
   .notes li::before { content: '✓'; position: absolute; left: 0; color: var(--vscode-charts-green); }
   .actions { display: flex; gap: 8px; margin: 22px 0 0; }
-  .tabs { display: flex; gap: 2px; margin: 14px 0 4px; flex-wrap: wrap;
-          border-bottom: 1px solid var(--vscode-panel-border); }
-  button.tab { background: transparent; color: var(--vscode-descriptionForeground);
-               border: 0; border-bottom: 2px solid transparent; border-radius: 0;
-               padding: 7px 12px; font-size: 0.92em; }
+  /* The strip sits on the header's own bottom rule — a second line here reads as a seam. */
+  .tabs { display: flex; gap: 4px; margin: 16px 0 12px; flex-wrap: wrap; align-items: center; }
+  /* Pills, not an underline: at six tabs the underline was a hairline nobody could find. */
+  button.tab { background: transparent; color: var(--dim);
+               border: 1px solid transparent; border-radius: 999px;
+               padding: 6px 14px; font-size: 0.94em; }
   button.tab:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
-  button.tab.on { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
+  button.tab.on { color: var(--vscode-button-foreground); background: var(--vscode-button-background);
+                  border-color: transparent; font-weight: 600; }
+  button.tab.on .count { background: color-mix(in srgb, var(--vscode-button-foreground) 25%, transparent);
+                         color: var(--vscode-button-foreground); }
   button.tab.refresh { margin-left: auto; padding: 4px 12px; display: inline-flex; align-items: center; gap: 6px; }
   button.tab.refresh .glyph { font-size: 1.35em; line-height: 1; }
   .count { display: inline-block; min-width: 15px; padding: 0 4px; border-radius: 8px;
            background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
            font-size: 0.77em; text-align: center; }
-  h2:first-of-type { margin-top: 18px; }
   textarea { width: 100%; min-height: 260px; box-sizing: border-box; padding: 10px 12px;
              border-radius: 6px; border: 1px solid var(--vscode-charts-green);
              background: var(--vscode-input-background); color: var(--vscode-input-foreground);

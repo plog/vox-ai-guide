@@ -4,7 +4,13 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { claudeUserDir, countLines, exists, managedDir, readJson } from './paths';
 
-export type Reader = 'claude' | 'copilot' | 'both';
+/**
+ * Who reads the file. 'other' covers the rest of the ecosystem — Cursor, Windsurf, Cline,
+ * Gemini, Codex, Zed, Aider, Junie. None of them is installed here necessarily; they are
+ * listed because a repo carries these files for the whole team, and because knowing the
+ * landscape is half of what this panel teaches.
+ */
+export type Reader = 'claude' | 'copilot' | 'both' | 'other';
 
 export interface InstructionFile {
   label: string;
@@ -15,6 +21,13 @@ export interface InstructionFile {
   gatedBy?: string;
   present: boolean;
   loaded: boolean;
+  /**
+   * Read only when something calls for it — a skill invoked, a sub-agent spawned, a slash
+   * command typed. The distinction matters more than presence: an always-loaded file is
+   * re-sent on every single turn and you pay for it every time, an on-demand one costs
+   * nothing until it is used. It is the whole argument for moving bulk out of CLAUDE.md.
+   */
+  onDemand?: boolean;
   lines: number;
   note?: string;
 }
@@ -287,6 +300,73 @@ export function scan(workspaceRoot?: string): ScanResult {
       gatedBy: 'chat.useNestedAgentsMdFiles',
       loaded: useNestedAgentsMd,
     },
+    // Loaded on demand. Claude Code keeps only the name and description of each skill,
+    // sub-agent and command in the always-on context; the body arrives when one is used.
+    // People write huge CLAUDE.md files precisely because nobody told them these exist.
+    {
+      label: 'Skills (project)',
+      file: ws('.claude/skills'),
+      reader: 'claude',
+      scope: 'Team — one SKILL.md per folder, body read when the skill runs',
+      loaded: true,
+      onDemand: true,
+    },
+    {
+      label: 'Skills (personal)',
+      file: path.join(home, 'skills'),
+      reader: 'claude',
+      scope: 'You, all projects',
+      loaded: true,
+      onDemand: true,
+    },
+    {
+      label: 'Sub-agents (project)',
+      file: ws('.claude/agents'),
+      reader: 'claude',
+      scope: 'Team — each .md is a separate agent with its own prompt',
+      loaded: true,
+      onDemand: true,
+    },
+    {
+      label: 'Sub-agents (personal)',
+      file: path.join(home, 'agents'),
+      reader: 'claude',
+      scope: 'You, all projects',
+      loaded: true,
+      onDemand: true,
+    },
+    {
+      label: 'Slash commands (project)',
+      file: ws('.claude/commands'),
+      reader: 'claude',
+      scope: 'Team — .md read only when you type /its-name',
+      loaded: true,
+      onDemand: true,
+    },
+    {
+      label: 'Slash commands (personal)',
+      file: path.join(home, 'commands'),
+      reader: 'claude',
+      scope: 'You, all projects',
+      loaded: true,
+      onDemand: true,
+    },
+    {
+      label: 'Prompt files (Copilot)',
+      file: ws('.github/prompts'),
+      reader: 'copilot',
+      scope: 'Team — *.prompt.md, run from the chat box',
+      loaded: true,
+      onDemand: true,
+    },
+    {
+      label: 'Chat modes (Copilot)',
+      file: ws('.github/chatmodes'),
+      reader: 'copilot',
+      scope: 'Team — *.chatmode.md, picked in the chat mode menu',
+      loaded: true,
+      onDemand: true,
+    },
     {
       label: "Claude's automatic memory",
       file: path.join(home, 'projects', '<project>', 'memory', 'MEMORY.md'),
@@ -294,6 +374,24 @@ export function scan(workspaceRoot?: string): ScanResult {
       scope: 'Written by Claude — first 200 lines loaded',
       loaded: true,
     },
+    // The rest of the ecosystem. Nobody has every one of these tools installed — the point
+    // is the opposite: these files travel in the repo, so a teammate on Cursor or Windsurf
+    // is being steered by a file you may never have opened. And a stale one still counts:
+    // Zed picks the FIRST match in its own order, so a leftover .cursorrules silently wins
+    // over the AGENTS.md someone carefully wrote.
+    { label: 'Cursor rules', file: ws('.cursor/rules'), reader: 'other', scope: 'Cursor — *.mdc, each with its own glob', loaded: true, onDemand: true },
+    { label: '.cursorrules (legacy)', file: ws('.cursorrules'), reader: 'other', scope: 'Cursor — deprecated, still read', loaded: true, note: 'Deprecated in favour of .cursor/rules — and it takes priority over AGENTS.md in some editors.' },
+    { label: 'Windsurf rules', file: ws('.windsurf/rules'), reader: 'other', scope: 'Windsurf — multi-file form', loaded: true, onDemand: true },
+    { label: '.windsurfrules (legacy)', file: ws('.windsurfrules'), reader: 'other', scope: 'Windsurf — single file', loaded: true },
+    { label: '.clinerules', file: ws('.clinerules'), reader: 'other', scope: 'Cline — file or folder', loaded: true },
+    { label: 'Roo rules', file: ws('.roo/rules'), reader: 'other', scope: 'Roo Code', loaded: true, onDemand: true },
+    { label: 'Continue rules', file: ws('.continue/rules'), reader: 'other', scope: 'Continue', loaded: true, onDemand: true },
+    { label: 'GEMINI.md', file: ws('GEMINI.md'), reader: 'other', scope: 'Gemini CLI / Code Assist', loaded: true },
+    { label: 'Gemini style guide', file: ws('.gemini/styleguide.md'), reader: 'other', scope: 'Gemini Code Assist — review style', loaded: true },
+    { label: '.aiexclude', file: ws('.aiexclude'), reader: 'other', scope: 'Gemini — files kept out of context', loaded: true },
+    { label: 'Zed rules', file: ws('.rules'), reader: 'other', scope: 'Zed — first match of its own list wins', loaded: true },
+    { label: 'CONVENTIONS.md', file: ws('CONVENTIONS.md'), reader: 'other', scope: 'Aider — added with --read', loaded: true },
+    { label: 'Junie guidelines', file: ws('.junie/guidelines.md'), reader: 'other', scope: 'JetBrains Junie', loaded: true },
   ];
 
   const instructions: InstructionFile[] = raw.map((r) => {

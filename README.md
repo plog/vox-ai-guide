@@ -12,14 +12,44 @@ This extension answers two questions, in plain words, on your own machine:
 It **explains** and it **suggests**. It never blocks, never sends anything anywhere, and never
 writes a file you have not seen a preview of.
 
+Above all, **it teaches.** A tool that silently fixed your configuration would leave you exactly
+as dependent tomorrow as you were today.
+
 <p align="center">
-  <img src="media/screenshots/fixes.png" width="640" alt="Suggested fixes: each with its why, its gain, and a Review button — nothing applied blind">
-</p>
-<p align="center">
-  <img src="media/screenshots/status-chats.png" width="480" alt="Status bar context counter, with the per-conversation list and a ready-to-paste /compact">
+  <img src="media/screenshots/secrets.png" width="520" alt="The panel header: four figures — secrets in your config, fixes suggested, lines re-sent every turn, context in this chat — each one a button into the tab that explains it">
 </p>
 
 ---
+
+## It is a teaching tool that happens to write files
+
+This is the part that explains every other design decision here.
+
+Nobody chose this mess. People inherited it — a `CLAUDE.md` copied from a blog post, a
+`.cursorrules` left by whoever tried Cursor for a week, a `.vscode/settings.json` committed by
+accident three sprints ago. The result is a configuration nobody on the team can read, and a bill
+nobody can account for. Fixing that for you, quietly, would buy one good afternoon and change
+nothing: the next file lands next month and the maze grows back.
+
+So every surface here is built to leave you knowing something:
+
+- **Every fix carries its *why* and its *gain*, in plain words**, before its Review button. You
+  can apply it — or read the two sentences, understand the mechanism, and never need the fix
+  again.
+- **Nothing is applied blind.** A mandatory before/after preview is a type-level requirement on a
+  fix (`preview()` is not optional in the code), because a diff you read is a lesson and a diff
+  you never see is magic.
+- **Absence is shown, not hidden.** A file you do not have still gets a row. You cannot learn the
+  shape of a system from a list of the parts you already installed.
+- **The distinctions are the content.** Files that *stack* versus settings that *override*.
+  *Present* versus *actually loaded*. *Always loaded* versus *on demand*. *Tracked by git* versus
+  *sent to the model*. Each of those is a rule people get wrong for months, at a real cost.
+- **"Not detected" tools are still documented**, and so is the rest of the ecosystem — Cursor,
+  Windsurf, Cline, Gemini, Zed, Aider, Junie. You are not the only reader of your repo: a
+  teammate on another tool is being steered by a file committed next to yours.
+
+The measurements exist for the same reason. "Subagents inherit the session's model" is an
+abstraction; **"86% of your spend was helper agents running on Opus"** is a thing you remember.
 
 ## Why both questions live in one extension
 
@@ -105,19 +135,73 @@ One idea per screen; the figures are one click deeper, as evidence for the word.
 
 `Vox AI: Diagnose my AI configuration` opens the full map in an editor tab:
 
+The page opens on four figures — secrets found, fixes available, lines re-sent on every turn,
+context size of the current chat — each one a button into the tab that explains it. Then:
+
 1. **Secrets in your config** — with, for each, *how it escapes*: pushed out, or sent to the model.
 2. **Current Claude session** — context size, model, subagents spawned. Read from the local
    transcript, since Claude Code exposes no API to an extension.
 3. **Suggested fixes** — each with its why.
-4. **Where your instructions live** — the 12 locations across both tools, and for each: who reads
-   it, its scope, whether it exists, and whether it is **actually loaded** (several depend on a
-   VSCode setting people forget to switch on).
+4. **Where your instructions live** — every location we know of, in four tables, and for each
+   file: who reads it, how far it reaches, whether it exists, and whether it is **actually
+   loaded** (several depend on a VSCode setting people forget to switch on).
+   - *What Claude Code reads*, numbered in the order it stacks them.
+   - *What Copilot reads*, unnumbered — it merges its files with no documented pecking order.
+   - *Loaded on demand* — `.claude/skills`, `.claude/agents`, `.claude/commands`,
+     `.github/prompts`, `.github/chatmodes`. Only their name and one-line description sit in the
+     permanent context; the body arrives when one is used. **This is the way out of a bloated
+     `CLAUDE.md`**, and most people have never been told these exist.
+   - *The rest of the ecosystem* — `.cursor/rules` and `.cursorrules`, `.windsurf/rules` and
+     `.windsurfrules`, `.clinerules`, `.roo/rules`, `.continue/rules`, `GEMINI.md`,
+     `.gemini/styleguide.md`, `.aiexclude`, `.rules` (Zed), `CONVENTIONS.md` (Aider),
+     `.junie/guidelines.md`. `AGENTS.md` is the standard several of these now agree on — and a
+     stale `.cursorrules` can quietly win over it, because some editors take the **first** file
+     they find rather than merging them all.
 5. **Active VSCode settings** — the effective value **and the layer it comes from**, plus the
    layers it overrides. A `workspace` setting lives in a version-controlled file.
 6. **Habits** — what no setting will ever do for you.
 
 "Not detected" is a first-class state: a tool you do not have still gets a row, so the sweep looks
 as complete as it is.
+
+## The status bar, and the chat it describes
+
+The bar shows one figure: the context size of a conversation, in thousands of tokens. Past your
+threshold it warns — that is the point where every turn resends a history you are paying for
+twice.
+
+*Which* conversation, though, is the hard part. Claude Code exposes no API for it, and VSCode's
+tab API deliberately hides a webview's identity. The extension reads the tab order Claude Code
+records in VSCode's own workspace state to identify the chat **in front of you** — an index, not
+a name, and written to fail silently if anything on their side changes. Failing that, you can
+**pin** a chat from the list so the figure stops drifting to whichever conversation wrote last: a
+terminal `claude` in the same folder will otherwise steal it.
+
+Clicking the bar lists every recent conversation with its own counter, and opens the one you
+pick. A ready-to-paste `/compact` sits at the top — the extension cannot send text into a chat,
+so it puts the command in your clipboard and focuses the input rather than pretending to run it
+for you.
+
+## Housekeeping: what your chat logs weigh
+
+`Vox AI: Clean up old conversation archives` answers a question nobody asks until the disk is
+full. Every conversation you have ever held is still on disk, including those of projects that no
+longer exist — often gigabytes, accumulated without anyone deciding it should be.
+
+The list groups logs by the folder they were held in, vanished projects first, then by size.
+Deleting is **the one irreversible act in this extension**, so it is fenced accordingly:
+
+- **Chat logs only.** No project folder, no file of yours. Every path is checked to sit inside a
+  known archive folder before anything happens to it.
+- **To the Trash, never an `unlink`.** Rather than warn you that the act cannot be undone, the
+  act is made undoable: restore anything from the Finder or Recycle Bin.
+- **Nothing preselected**, and a modal naming the exact count and size before it runs.
+- **The live conversation is spared** — Claude Code writes to it continuously.
+- Failures and skipped files are reported as they happened. A partial result never poses as a
+  clean one.
+
+Worth knowing before you tick a box: deleting a transcript also removes the ability to resume
+that chat, and the spend figures elsewhere in this extension are computed *from* these files.
 
 ## No telemetry. At all.
 
@@ -171,12 +255,14 @@ a fix without one would be a fix applied blind.
 
 | File | Role |
 |---|---|
-| `src/scan.ts` | The 12 instruction locations, the 4 settings layers, the VSCode layers via `inspect()`, the warnings |
+| `src/scan.ts` | Every instruction location — Claude Code, Copilot, on-demand, and the third-party ecosystem — the 4 settings layers, the VSCode layers via `inspect()`, the warnings |
 | `src/secrets.ts` | Credential detection. **Never carries a value** |
 | `src/fixes.ts` | The fixes and the tips |
 | `src/usage.ts` | Reads the local transcripts: current session, and the three-way spend split |
 | `src/panel.ts` | The full map, in an editor webview |
 | `src/sidebar.ts` | The activity-bar webview: the four screens, and the badge |
+| `src/cleanup.ts` | Grouping and deletion of conversation archives. Trash only, inside known roots |
+| `src/claudeTabs.ts` | Which chat is on screen, from Claude Code's tab order. Fails silently by design |
 | `src/paths.ts` | Cross-platform paths, project-folder encoding, JSON I/O with `.bak` |
 
 Only `--vscode-*` variables are used for colour, so Light and High Contrast work without a second

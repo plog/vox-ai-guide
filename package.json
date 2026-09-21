@@ -2,7 +2,7 @@
   "name": "vox-ai-guide",
   "displayName": "Vox AI Guide for VSCode",
   "description": "Explains where your Copilot and Claude configuration lives, what it costs in tokens, and which credentials it exposes. Local only, nothing is written without a preview.",
-  "version": "0.4.1",
+  "version": "0.5.1",
   "publisher": "plog",
   "icon": "media/icon.png",
   "engines": {
@@ -40,6 +40,11 @@
       {
         "command": "voxAiGuide.checkTranscripts",
         "title": "Vox AI: Scan my Claude transcripts for secrets",
+        "category": "Vox AI"
+      },
+      {
+        "command": "voxAiGuide.cleanup",
+        "title": "Vox AI: Clean up old conversation archives",
         "category": "Vox AI"
       },
       {
@@ -104,7 +109,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "test": "npm run compile && node test/nondisclosure.js",
+    "test": "npm run compile && node test/nondisclosure.js && node test/cleanup.js",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",
     "package": "npx @vscode/vsce package"
