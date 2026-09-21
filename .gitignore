@@ -17,3 +17,6 @@ design/
 # OS / editor noise
 .DS_Store
 *.log
+
+# Post-mortems et notes d'incident : internes, jamais versionnés
+docs/postmortem-*.md
