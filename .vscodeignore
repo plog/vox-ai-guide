@@ -9,6 +9,12 @@ test/**
 *.vsix
 .env
 .env.*
+*.bak
+.claude/**
+.mcp.json
+feedback/**
+design/**
+docs/**
 
 # Screenshots showing real conversation titles: kept locally, never shipped.
 media/screenshots/fixes.png
